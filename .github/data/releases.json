@@ -6,7 +6,7 @@
       "release": "0.9.0",
       "arch": "x86_64",
       "sync": "tar",
-      "shutdown": "",
+      "shutdown": "shutdown",
       "desktop": false,
       "build": true
     }
