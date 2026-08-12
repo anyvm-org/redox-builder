@@ -1,0 +1,13 @@
+# enablessh.txt -- NO-OP for redox-builder.
+#
+# Every other anyvm builder pastes this script into the freshly-booted guest to
+# turn on sshd and authorize the build key. Redox 0.9.0 has no sshd and cannot
+# get one, so there is nothing to paste: the guest is driven over telnet
+# (VM_TRANSPORT=telnet) by /usr/bin/anyvmd, which hooks/host_prepareImage.py
+# injected into the image offline, before first boot.
+#
+# This file exists only because build.py:_gen_enablessh_local() copies it to
+# enablessh.local before running the enablessh hook. hooks/host_enablessh.py
+# takes over from there: it proves the injected agent answers the readiness
+# marker on the forwarded port, and fails the build if it does not.
+true

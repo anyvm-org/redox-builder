@@ -1,0 +1,42 @@
+# local build outputs (multi-GB qcow2/zst artifacts; keeping them out of git
+# also keeps them out of any `git stash -u` during pulls)
+build/
+build-out-*/
+build-failed-*/
+build-*.log
+*.qcow2
+*.qcow2.xz
+*.qcow2.zst
+
+# Redox's own prebuilt image and anything unpacked from it. Nothing upstream
+# is vendored here -- hooks/host_prepareImage.py fetches it at build time --
+# so none of it may ever be committed.
+*.img
+*.img.zst
+
+# The compiled agent. tools/build-anyvmd.sh produces it from files/anyvmd.rs,
+# and it is deliberately NOT committed: it is a binary that would otherwise
+# have to be trusted on sight, and rebuilding it is fully pinned (relibc at
+# 3da3ff11, redox_syscall =0.5.3, nightly-2024-09-01) so anyone can reproduce
+# it byte for byte.
+files/anyvmd.bin
+
+# the agent build tree: the relibc clone, the vendored crates and cargo target
+build/anyvmd/
+
+# python bytecode caches (hooks/upstream_check.py imports gendata)
+__pycache__/
+*.pyc
+
+# build.py web-console runtime leftovers
+index.html
+screen.txt
+screen.png
+_screenText.txt
+
+# build.py materializes this from enablessh.txt on every run. It is the one
+# generated file that deliberately stays at the repo root rather than under
+# WORKDIR (build.py:3894 -- several guests' hooks open it by bare name).
+# Everything else build.py generates already lands in build/, ignored above:
+# the qcow2, the raw img, the pid/port/cmdline state files and the serial log.
+enablessh.local
