@@ -56,10 +56,17 @@ ptyd is already running on the stock image.
 
 ## What this buys
 
-redox gets a REAL shell, so it uses the generic plan9-style arm of
-`_tar_push_telnet` (`... && tar x && echo marker`) rather than a riscos-style
-arm where the agent parses the command line itself. `/bin/tar` is on the
-stock image, so nothing has to be baked in.
+redox gets a REAL shell, so it takes the generic plan9-style arm of
+`_tar_push_telnet` (`... && tar x && echo marker`) unchanged -- ion collapses
+`''` the way rc and sh do, so no new arm is needed. `/bin/tar` is on the stock
+image, so nothing has to be baked in.
+
+The tar LINES are still parsed by the agent rather than run by ion, the same
+as riscos and reactos: the archive has to be unescaped on the way in and
+escaped on the way out, and a shell cannot do that. That is also why anyvm's
+`_tar_pull_telnet` gives redox `skip_echo=False` -- the agent never echoes the
+line it was sent, so there is nothing to skip, and the plan9 default would eat
+the first block of the archive instead.
 
 bash is unusable regardless of what the agent does -- no single fd can be both
 a socket and a terminal, and bash insists on asking whether stdin is a socket.

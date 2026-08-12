@@ -14,8 +14,8 @@
 // gets real process creation without ever linking the relibc CRT
 // (relibc_start_v1), which is the thing that UD2s on this frozen image.
 //
-// TWO STDIO PATHS, ON PURPOSE
-// ---------------------------
+// THREE STDIO PATHS, ON PURPOSE
+// -----------------------------
 // relibc dispatches fd queries on the fd's SCHEME and understands only tcp,
 // udp and chan (src/platform/redox/socket.rs:186-197). Hand a child a raw TCP
 // socket as its stdio and anything that asks about its terminal -- `ls` sizing
@@ -23,14 +23,43 @@
 // answer smolnetd never sends. Measured: `ls /bin` and `ion -c` both sat in
 // state UB (User Blocked) after ~0.01s of CPU. On a pty both run normally.
 //
-// But a pty is a terminal, and a terminal must not carry a tar archive. So:
+// But a pty is a terminal, and a terminal must not carry a tar archive. And
+// the socket is not 8-bit clean either: it is a TELNET session, where 0xFF is
+// IAC and travels doubled. So neither of the two obvious fds can be tar's data
+// channel, and the agent has to sit in the middle of every transfer:
 //
-//   commands  -> /bin/ion -c "<line>"  with stdio on a PTY   (needs a terminal)
-//   tar       -> /bin/tar              with stdio on the SOCKET (must stay binary)
+//   commands -> /bin/ion -c "<line>"        stdio on a PTY (needs a terminal)
+//   tar x    -> /bin/tar x                  stdin from a PIPE the poll loop
+//                                           unescapes the socket into
+//   tar c    -> /bin/tar cf <tmp> .         archive to a FILE, streamed out
+//                                           escaped once tar has exited
 //
-// tar never queries the terminal -- it was verified working with a raw socket
-// as stdio before the pty was introduced -- so the split costs nothing and
-// keeps the archive bytes away from any line discipline.
+// The two directions are deliberately NOT symmetric; see below.
+//
+// WHY tar c GOES THROUGH A FILE AND NOT A PIPE
+// --------------------------------------------
+// Redox's tar prints the name of every file it archives to STDOUT, in among
+// the archive bytes, and no flag turns that off (it rejects --help and knows
+// only c/t/x with an optional f). A three-file /work came back as 11297 bytes
+// where the archive is 11264 -- the extra 33 being exactly
+// "./ascii.txt\n./bin.dat\n./back.dat\n". Escaping cannot save a stream that
+// has prose spliced into it, so the archive goes to a file, the listing goes
+// to a scratch file, and the archive is sent afterwards.
+//
+// THE IAC BUG (fixed here; kept because the failure is so quiet)
+// --------------------------------------------------------------
+// anyvm.py is RFC 856-correct: _TelnetTarWriter doubles 0xFF on push and
+// _telnet_eat_iac collapses it on pull. The agent negotiated BINARY and
+// unescaped its COMMAND stream from the start -- but dup2'd the raw socket
+// onto tar's stdio, so the archive itself bypassed both. Push therefore
+// delivered every 0xFF twice and pull delivered it zero times.
+//
+// It survived every early test because a pure-ASCII archive contains no 0xFF
+// at all. It was finally caught with a 4 KiB payload holding 1366 of them:
+// the file arrived at exactly the right SIZE with the wrong checksum (host
+// cksum 3709862552, guest 954512061) and tar said "numeric field did not have
+// utf-8 text". Length-preserving corruption of binary files only -- nothing a
+// green CI run with text fixtures would ever show.
 //
 // bash cannot be used at all, whatever we do: it probes stdin with
 // getpeername() to detect being run from inetd, and relibc panics rather than
@@ -50,7 +79,8 @@ use core::fmt::Write as _;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use redox_rt::proc::{fexec_impl, new_child_process, ExtraInfo, FdGuard, FexecResult};
-use syscall::flag::{O_CLOEXEC, O_CREAT, O_NONBLOCK, O_RDONLY, O_RDWR};
+use syscall::flag::{F_GETFL, F_SETFL, O_CLOEXEC, O_CREAT, O_NONBLOCK, O_RDONLY, O_RDWR,
+                    O_TRUNC, O_WRONLY};
 
 // Port 23 -- the telnet port, and the one every VM_TRANSPORT=telnet guest in
 // this fleet uses (plan9's telnetd, reactos' anyvmtd.exe). build.py emits
@@ -272,6 +302,96 @@ impl Telnet {
     }
 }
 
+// ---- pipes -----------------------------------------------------------------
+
+/// Make a pipe, returning (read end, write end).
+///
+/// There is no pipe2 syscall on this kernel: redox_syscall 0.5.3 has neither
+/// `pipe2` nor `SYS_PIPE2`, because a pipe is a SCHEME -- you open it for the
+/// read end and dup it BY NAME for the write end. Taken from relibc's own
+/// pipe2 (src/platform/redox/extra.rs:16-28) at the pinned 0.9.0-era commit,
+/// including the detail that decides both call sites below: the write end does
+/// NOT inherit the open flags, which is exactly why relibc fcntls it
+/// separately. So `flags` here applies to the READ end only, and each caller
+/// sets the write end itself when it needs to.
+fn pipe_new(flags: usize) -> syscall::Result<(usize, usize)> {
+    let rd = syscall::open("/scheme/pipe", flags)?;
+    match syscall::dup(rd, b"write") {
+        Ok(wr) => Ok((rd, wr)),
+        Err(e) => {
+            let _ = syscall::close(rd);
+            Err(e)
+        }
+    }
+}
+
+/// Turn O_NONBLOCK on for `fd`, and report whether it actually took.
+///
+/// The read-back is not paranoia. On the socket a silent no-op is fatal rather
+/// than slow: the push loop would block in read() after the host's last
+/// archive byte -- the host sends nothing more and does not half-close on this
+/// path -- and so would never reach waitpid again. Better to detect that here
+/// and refuse the pipe path than to hang the connection.
+fn set_nonblock(fd: usize) -> bool {
+    let cur = match syscall::fcntl(fd, F_GETFL, 0) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    if syscall::fcntl(fd, F_SETFL, cur | O_NONBLOCK).is_err() {
+        return false;
+    }
+    match syscall::fcntl(fd, F_GETFL, 0) {
+        Ok(f) => (f & O_NONBLOCK) != 0,
+        Err(_) => false,
+    }
+}
+
+/// Feeds the host's telnet stream into a child's stdin, unescaping on the way.
+///
+/// This is the direction spawn_and_wait never had. Its `pump_to` moves
+/// child -> host and ESCAPES; this moves host -> child and UNESCAPES.
+struct Push {
+    sock: usize,
+    pipe: usize,
+    buf: [u8; 2048],
+    head: usize,
+    tail: usize,
+}
+
+impl Push {
+    /// One turn of the pump. Returns true if any byte moved, which the caller
+    /// uses to decide whether to sleep: an archive must not be paced at one
+    /// pipe buffer per 250 ms.
+    fn step(&mut self, t: &mut Telnet) -> bool {
+        let mut moved = false;
+        // Flush what is already unescaped before taking more. The write end is
+        // non-blocking, so a full pipe is not an error -- it just means tar has
+        // not caught up, and we come back next turn. Returning early here is
+        // the backpressure.
+        while self.head < self.tail {
+            match syscall::write(self.pipe, &self.buf[self.head..self.tail]) {
+                Ok(0) | Err(_) => return moved,
+                Ok(n) => {
+                    self.head += n;
+                    moved = true;
+                }
+            }
+        }
+        self.head = 0;
+        self.tail = 0;
+        // Half the buffer, so a worst-case all-IAC read still fits unescaped.
+        let mut raw = [0u8; 1024];
+        match syscall::read(self.sock, &mut raw) {
+            Ok(0) | Err(_) => {}
+            Ok(n) => {
+                self.tail = t.unescape(&raw[..n], &mut self.buf);
+                moved = true;
+            }
+        }
+        moved
+    }
+}
+
 // ---- entry -----------------------------------------------------------------
 // Nothing runs before e_entry: the kernel sets RIP/RSP directly and [rsp] is
 // argc, not a return address. fsbase is 0 -- no TCB -- which is fine because
@@ -298,19 +418,27 @@ unsafe extern "C" fn rust_start(_sp: *const usize) -> ! {
 
 // ---- spawning --------------------------------------------------------------
 
-/// Spawn `path`, with fds 0/1/2 bound to `stdio`, and wait for it.
+/// Spawn `path` with fds 0/1/2 bound to `fd_in`/`fd_out`/`fd_err`, and wait.
 /// Returns the raw wait status, or usize::MAX if it never exited.
-/// `pump_to` is drained into the telnet stream while waiting (the pty master);
-/// pass usize::MAX when the child writes straight to the socket itself.
-fn spawn_and_wait(cur_ft: &FdGuard, t: &mut Telnet, stdio: usize, pump_to: usize,
+///
+/// The three fds are separate rather than one `stdio` because tar needs them
+/// to differ: on a create its stdout is a pipe we escape, while its stderr
+/// must NOT be, or a diagnostic would be spliced into the archive.
+///
+/// `pump_to` is drained into the telnet stream while waiting, escaping as it
+/// goes (the pty master, or a tar create's pipe); pass usize::MAX for none.
+/// `push` is the opposite direction and is used only by tar extract.
+fn spawn_and_wait(cur_ft: &FdGuard, t: &mut Telnet,
+                  fd_in: usize, fd_out: usize, fd_err: usize,
+                  pump_to: usize, mut push: Option<&mut Push>,
                   path: &str, args: &[&[u8]], envs_in: &[&[u8]], cwd: Option<&[u8]>)
     -> syscall::Result<usize>
 {
     // 0/1/2 must be right BEFORE the snapshot: there is no per-fd insertion
     // API for another context, so the child's table can only be a copy of ours.
-    for target in 0..3usize {
-        let _ = syscall::dup2(stdio, target, b"");
-    }
+    let _ = syscall::dup2(fd_in, 0, b"");
+    let _ = syscall::dup2(fd_out, 1, b"");
+    let _ = syscall::dup2(fd_err, 2, b"");
 
     // argc+envc must be ODD or the child's initial sp is not 16-aligned and it
     // dies on its first movaps with no message. Pad here so no caller has to
@@ -375,16 +503,30 @@ fn spawn_and_wait(cur_ft: &FdGuard, t: &mut Telnet, stdio: usize, pump_to: usize
     syscall::write(*start, &[0])?;
     drop(start);
 
-    // Poll, pumping on every turn. A blocking wait would stall the output of a
-    // long-running command until it exited.
+    // Poll, pumping both directions on every turn. A blocking wait would stall
+    // the output of a long-running command until it exited.
+    //
+    // The timeout counts IDLE turns only. The old loop was a flat 2400 turns
+    // and slept 250 ms on every one of them, which was fine when the only
+    // thing being pumped was a command's console output -- but it caps a tar
+    // stream at one pipe buffer per 250 ms, and would then kill a transfer
+    // that was still making perfectly good progress. Sleeping only when
+    // nothing moved keeps the 600 s stall deadline exactly as it was while
+    // letting an active transfer run at the pipe's speed.
     let mut status = 0usize;
     let mut buf = [0u8; 1024];
-    for _ in 0..(4 * 600) {
+    let mut idle = 0usize;
+    loop {
+        let mut moved = false;
         if pump_to != usize::MAX {
             while let Ok(n) = syscall::read(pump_to, &mut buf) {
                 if n == 0 { break; }
                 t.write(&buf[..n]);
+                moved = true;
             }
+        }
+        if let Some(p) = push.as_mut() {
+            if p.step(t) { moved = true; }
         }
         match syscall::waitpid(pid, &mut status, syscall::flag::WNOHANG) {
             Ok(0) => {}
@@ -399,11 +541,22 @@ fn spawn_and_wait(cur_ft: &FdGuard, t: &mut Telnet, stdio: usize, pump_to: usize
             }
             Err(_) => return Ok(usize::MAX),
         }
-        let req = syscall::TimeSpec { tv_sec: 0, tv_nsec: 250_000_000 };
+        // Busy turn: come straight back, but YIELD first. A bare `continue`
+        // here is a hot spin, and on a microkernel that is not just impolite
+        // -- the network stack is another userspace process (smolnetd), and
+        // starving it is how a single-threaded agent misses the next
+        // connection. 1 ms still leaves the pipe as the throughput limit.
+        let (nsec, credit) = if moved { (1_000_000, false) } else { (250_000_000, true) };
+        if credit {
+            idle += 1;
+            if idle >= 4 * 600 {
+                return Ok(usize::MAX);
+            }
+        }
+        let req = syscall::TimeSpec { tv_sec: 0, tv_nsec: nsec };
         let mut rem = syscall::TimeSpec { tv_sec: 0, tv_nsec: 0 };
         let _ = syscall::nanosleep(&req, &mut rem);
     }
-    Ok(usize::MAX)
 }
 
 // ---- command dispatch ------------------------------------------------------
@@ -414,6 +567,10 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
         if &hay[i..i + needle.len()] == needle { return Some(i); }
     }
     None
+}
+
+fn starts(hay: &[u8], pre: &[u8]) -> bool {
+    hay.len() >= pre.len() && &hay[..pre.len()] == pre
 }
 
 /// Pull the first single-quoted run out of a command line -- the guest path in
@@ -447,15 +604,24 @@ const ENVS: [&[u8]; 4] = [b"PATH=/bin", b"HOME=/root", b"USER=root", b"TERM=dumb
 /// read on an empty socket, which would wedge the agent; closing is both safe
 /// and what the host does anyway, since _tar_push_telnet opens its own
 /// connection for the transfer and drops it once the marker arrives.
-fn dispatch(c: &Ctx, t: &mut Telnet, line: &[u8]) -> bool {
+fn dispatch(c: &Ctx, t: &mut Telnet, line: &[u8], pending: &[u8]) -> bool {
     arena_reset();
     let mut dirbuf = [0u8; 256];
 
-    // tar EXTRACT. The archive bytes follow on this same connection, so tar
-    // must read the socket directly -- routing binary through the pty would
-    // hand it to a line discipline. tar never queries the terminal (verified:
-    // it ran fine with a raw socket as stdio), so this is safe.
-    if find(line, b"tar -xf -").is_some() || find(line, b"tar x").is_some() {
+    // tar EXTRACT. The archive bytes follow on this same connection, and they
+    // are TELNET-ESCAPED: handing tar the socket would feed it doubled 0xFF.
+    // So tar reads a pipe and this loop does the unescaping.
+    //
+    // Both tar branches are anchored on the line PREFIX, not on "tar x" or
+    // "tar c" alone. A bare substring test hijacks any user command that
+    // happens to contain one -- `tar cf backup.tar .` sent through anyvm's
+    // `-- cmd` came back as "anyvmd: no directory in tar line" instead of
+    // running. anyvm only ever emits these two shapes:
+    //   push: mkdir -p '<dir>' && cd '<dir>' && tar x && echo anyvm''-tar-done
+    //   pull: cd '<dir>' && tar c .
+    if starts(line, b"mkdir -p '")
+        && (find(line, b"tar x").is_some() || find(line, b"tar -xf -").is_some())
+    {
         let dir = match quoted(line, &mut dirbuf) {
             Some(d) => d,
             None => { t.write(b"anyvmd: no directory in tar line\r\n"); return false; }
@@ -471,18 +637,63 @@ fn dispatch(c: &Ctx, t: &mut Telnet, line: &[u8]) -> bool {
         mk[n] = b'\'';
         n += 1;
         let mkargs: [&[u8]; 3] = [b"ion", b"-c", &mk[..n]];
-        let _ = spawn_and_wait(&c.cur_ft, t, c.pty_slave, c.pty_master,
-                               "/bin/ion", &mkargs, &ENVS, None);
+        let _ = spawn_and_wait(&c.cur_ft, t, c.pty_slave, c.pty_slave, c.pty_slave,
+                               c.pty_master, None, "/bin/ion", &mkargs, &ENVS, None);
 
         arena_reset();
+
+        // Read end BLOCKING -- that is tar's stdin, and it must WAIT for the
+        // host rather than see EAGAIN and treat a slow link as end of input.
+        // Our write end non-blocking, so a full pipe cannot stall the same
+        // loop that has to keep reaping tar.
+        let mut prd = usize::MAX;
+        let mut pwr = usize::MAX;
+        match pipe_new(0) {
+            Ok((rd, wr)) => {
+                if set_nonblock(wr) && set_nonblock(c.sock) {
+                    prd = rd;
+                    pwr = wr;
+                } else {
+                    // Never silently: this is the corrupting path.
+                    dbgf!("O_NONBLOCK refused; tar extract falls back to the \
+                           raw socket and WILL corrupt any file with 0xFF in it");
+                    let _ = syscall::close(rd);
+                    let _ = syscall::close(wr);
+                }
+            }
+            Err(e) => dbgf!("no pipe for tar extract (errno {}); raw socket \
+                             fallback, binary files will be corrupted", e.errno),
+        }
+
         // `x`, not `-xf -`. Redox's tar is the old BSD form and rejects the
         // GNU spelling outright: "tar: -xf: unknown operation / need to
         // specify c[f] (create), t[f] (list), or x[f] (extract)". The f is
-        // optional there, and without it tar reads stdin, which is the socket.
+        // optional there, and without it tar reads stdin -- the pipe.
         let targs: [&[u8]; 2] = [b"tar", b"x"];
-        let st = spawn_and_wait(&c.cur_ft, t, c.sock, usize::MAX,
-                                "/bin/tar", &targs, &ENVS, Some(dir));
-        // Put our own stdio back before answering.
+        let st = if prd != usize::MAX {
+            let mut push = Push { sock: c.sock, pipe: pwr,
+                                  buf: [0u8; 2048], head: 0, tail: 0 };
+            // Archive bytes that arrived in the SAME read as the command line
+            // are already unescaped and would otherwise be dropped on the
+            // floor. Seeding them here also closes that race for good: it only
+            // stayed hidden because the host sleeps 1 s after the tar line.
+            let k = if pending.len() > push.buf.len() { push.buf.len() }
+                    else { pending.len() };
+            push.buf[..k].copy_from_slice(&pending[..k]);
+            push.tail = k;
+            let r = spawn_and_wait(&c.cur_ft, t, prd, c.sock, c.sock,
+                                   usize::MAX, Some(&mut push),
+                                   "/bin/tar", &targs, &ENVS, Some(dir));
+            let _ = syscall::close(prd);
+            let _ = syscall::close(pwr);
+            r
+        } else {
+            spawn_and_wait(&c.cur_ft, t, c.sock, c.sock, c.sock,
+                           usize::MAX, None, "/bin/tar", &targs, &ENVS, Some(dir))
+        };
+        // Put our own stdio back before answering. The socket is left
+        // non-blocking on purpose: every exit from this branch returns true,
+        // so the connection closes and nothing reads it again.
         for i in 0..3usize { let _ = syscall::dup2(c.sock, i, b""); }
         if let Ok(s) = st {
             if s != usize::MAX && (s & 0xff00) == 0 {
@@ -494,24 +705,81 @@ fn dispatch(c: &Ctx, t: &mut Telnet, line: &[u8]) -> bool {
         return true;
     }
 
-    // tar CREATE -- same reasoning, the other direction.
-    if find(line, b"tar -cf -").is_some() || find(line, b"tar c").is_some() {
+    // tar CREATE. Not a mirror of the extract path, because Redox's tar makes
+    // streaming impossible: it prints the name of every file it archives to
+    // STDOUT, interleaved with the archive itself. Measured on a three-file
+    // /work -- 11297 bytes arrived where the archive is 11264, the extra 33
+    // being exactly "./ascii.txt\n./bin.dat\n./back.dat\n". No flag turns it
+    // off (this tar rejects --help and knows only c/t/x with an optional f).
+    //
+    // So tar writes to a FILE, its listing goes somewhere harmless, and the
+    // archive is streamed afterwards -- escaped, because a literal 0xFF would
+    // otherwise be read as IAC by the host's _telnet_eat_iac and swallowed
+    // along with the byte after it. Nothing shares the socket while tar runs,
+    // so the result is clean by construction rather than by timing.
+    //
+    // ARC lives outside the tree being archived. That holds for anyvm, whose
+    // guest paths are mount points like /work; archiving / or /tmp itself
+    // would feed tar the file it is writing.
+    if starts(line, b"cd '")
+        && (find(line, b"tar c").is_some() || find(line, b"tar -cf -").is_some())
+    {
         let dir = match quoted(line, &mut dirbuf) {
             Some(d) => d,
             None => { t.write(b"anyvmd: no directory in tar line\r\n"); return false; }
         };
-        let targs: [&[u8]; 3] = [b"tar", b"c", b"."];
-        let _ = spawn_and_wait(&c.cur_ft, t, c.sock, usize::MAX,
-                               "/bin/tar", &targs, &ENVS, Some(dir));
+        const ARC: &str = "/tmp/anyvm-pull.tar";
+        const LOG: &str = "/tmp/anyvm-pull.log";
+
+        // The listing can be one line per file, so it must not go to the pty
+        // (an undrained master would block tar once its buffer filled) nor to
+        // the serial console (slow enough to pace the whole transfer).
+        let logfd = syscall::open(LOG, O_CREAT | O_WRONLY | O_TRUNC)
+            .unwrap_or(usize::MAX);
+        let outfd = if logfd == usize::MAX { c.pty_slave } else { logfd };
+        // `> 2` and not merely "is set": if /scheme/debug had landed on a low
+        // fd, the dup2 onto 0/1/2 inside spawn_and_wait would clobber it and
+        // the diagnostics would go somewhere arbitrary.
+        let dbg = DBG.load(Ordering::Relaxed);
+        let errfd = if dbg > 2 && dbg != usize::MAX { dbg } else { outfd };
+
+        let targs: [&[u8]; 4] = [b"tar", b"cf", ARC.as_bytes(), b"."];
+        let st = spawn_and_wait(&c.cur_ft, t, c.sock, outfd, errfd,
+                                usize::MAX, None, "/bin/tar", &targs, &ENVS,
+                                Some(dir));
         for i in 0..3usize { let _ = syscall::dup2(c.sock, i, b""); }
+        if logfd != usize::MAX {
+            let _ = syscall::close(logfd);
+            let _ = syscall::unlink(LOG);
+        }
+        match st {
+            Ok(s) if s != usize::MAX && (s & 0xff00) == 0 => {}
+            _ => dbgf!("tar create did not exit cleanly; sending what it wrote"),
+        }
+
+        match syscall::open(ARC, O_RDONLY) {
+            Ok(fd) => {
+                let mut buf = [0u8; 4096];
+                loop {
+                    match syscall::read(fd, &mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => t.write(&buf[..n]),
+                    }
+                }
+                let _ = syscall::close(fd);
+            }
+            Err(e) => dbgf!("tar create left no archive at {} (errno {})",
+                            ARC, e.errno),
+        }
+        let _ = syscall::unlink(ARC);
         return true;
     }
 
     // Everything else is a real shell line. ion, on a pty, because a shell on
     // a raw socket blocks forever in relibc's terminal query.
     let args: [&[u8]; 3] = [b"ion", b"-c", line];
-    let _ = spawn_and_wait(&c.cur_ft, t, c.pty_slave, c.pty_master,
-                           "/bin/ion", &args, &ENVS, None);
+    let _ = spawn_and_wait(&c.cur_ft, t, c.pty_slave, c.pty_slave, c.pty_slave,
+                           c.pty_master, None, "/bin/ion", &args, &ENVS, None);
     for i in 0..3usize { let _ = syscall::dup2(c.sock, i, b""); }
     false
 }
@@ -614,7 +882,11 @@ fn serve() {
                     // strip a trailing CR
                     let mut end = clen;
                     if end > 0 && cmd[end - 1] == b'\r' { end -= 1; }
-                    if end > 0 && dispatch(&ctx, &mut t, &cmd[..end]) {
+                    // Anything already unescaped past this newline belongs to
+                    // whatever the command reads next -- on a tar extract that
+                    // is the head of the archive. Hand it over rather than
+                    // letting the `done` break discard it.
+                    if end > 0 && dispatch(&ctx, &mut t, &cmd[..end], &app[i + 1..m]) {
                         done = true;
                         break;
                     }

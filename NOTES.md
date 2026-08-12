@@ -50,9 +50,10 @@ stdio and anything that asks about its terminal -- `ls` sizing its columns,
 any shell -- goes down the tcp arm and waits forever for an answer smolnetd
 never sends; `ps` shows it as `UB` (User Blocked) after ~0.01s of CPU. On a
 pty the same binaries run normally. But a pty is a terminal and must not carry
-a tar archive, so the agent uses **both**: `ion -c` on a pty for commands, and
-the raw socket for tar, which is the one thing that never queries the
-terminal.
+a tar archive, so commands get `ion -c` on a pty and tar gets something else
+again -- see "The tar channel" below. It is emphatically *not* the raw socket:
+that is a telnet session, and it corrupted every binary file for as long as it
+was used.
 
 Two hypotheses this killed on the way, both plausible and both wrong: it is
 not the TLS segment (`/bin/diff` has byte-identical TLS to bash, 0xb8, and
@@ -72,8 +73,36 @@ handles `&&` and `;`.
 
 **Redox's tar is the old BSD form.** `tar -xf -` is rejected outright
 ("unknown operation ... need to specify c[f] (create), t[f] (list), or x[f]
-(extract)"). The `f` is optional, so the agent runs `tar x` (stdin) and
-`tar c .`.
+(extract)"). The `f` is optional, so `tar x` reads stdin.
+
+## The tar channel
+
+Three defects lived here, and each one is invisible to a text fixture.
+
+**The archive skipped telnet escaping entirely.** anyvm is RFC 856-correct --
+`_TelnetTarWriter` doubles 0xFF on the way out, `_telnet_eat_iac` collapses it
+on the way back -- and the agent unescaped its *command* stream from the start.
+But it dup2'd the raw socket onto tar's stdio, so the archive went through
+neither half: push delivered every 0xFF twice, pull delivered it zero times.
+Files arrived at exactly the right size with the wrong contents. A pure-ASCII
+archive has no 0xFF in it at all, which is why it took a 4 KiB payload with
+1366 of them to see it (guest tar: "numeric field did not have utf-8 text").
+Extract now reads a **pipe** that the poll loop unescapes the socket into.
+
+**Redox's tar prints its file listing to stdout, into the archive.** So `tar c`
+can never produce a clean stream no matter how it is escaped. A three-file
+`/work` came back as 11297 bytes where the archive is 11264 -- the extra 33
+being exactly `./ascii.txt\n./bin.dat\n./back.dat\n`. Nothing suppresses it;
+this tar rejects `--help` and has no quiet flag. Create therefore writes to
+`/tmp/anyvm-pull.tar`, sends the listing to a scratch file, and the agent
+streams the archive out (escaped) once tar has exited. Nothing shares the
+socket while tar runs, so the stream is clean by construction.
+
+**The interception matched a bare substring.** Any command line containing
+`tar c` or `tar x` was swallowed, so a user's own `tar cf backup.tar .` through
+`anyvm -- cmd` answered "anyvmd: no directory in tar line" instead of running.
+Both branches are now anchored on the line prefix (`mkdir -p '` / `cd '`),
+which are the only two shapes anyvm emits.
 
 ## Verified end to end
 
@@ -85,6 +114,17 @@ Against a stock image, driven exactly as anyvm.py drives it:
 | command | `echo A && uname; echo B` | `A` / `Redox` / `B` |
 | tar push | the plan9 line + a real 10 KiB archive | `anyvm-tar-done` |
 | verify | `ls /work; cat /work/justcheck.txt` | the file and its contents |
+
+And, since a text fixture proves nothing about this channel, a binary round
+trip with a 4 KiB payload built to be hostile to it -- every `FF xx` pair
+(`IAC IAC`, `IAC SE`, `IAC SB`, `IAC WILL/WONT/DO/DONT`) plus a 512-byte
+unbroken IAC run, 781 0xFF bytes in all:
+
+| leg | check | result |
+|---|---|---|
+| push | host `cksum` vs guest `cksum` | `28375533 4096` both sides |
+| pull | guest copy of it fetched back | byte-identical, 4096 bytes |
+| no hijack | a `-- cmd` containing `tar cf` | ran, not intercepted |
 
 `ion` collapses `''` the way rc and sh do, so redox needs **no new arm** in
 anyvm's `telnet_ready()` -- the existing generic probe works unchanged -- and
